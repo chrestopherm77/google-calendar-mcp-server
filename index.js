@@ -1,631 +1,452 @@
-#!/usr/bin/env node
+const express = require('express');
+const { google } = require('googleapis');
+const cors = require('cors');
 
-import express from 'express';
-import cors from 'cors';
-import { google } from 'googleapis';
-import fs from 'fs/promises';
-import path from 'path';
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-class GoogleCalendarRestServer {
-  constructor() {
-    this.app = express();
-    this.tokens = new Map(); // Armazenamento em memória dos tokens
-    this.setupMiddleware();
-    this.setupRoutes();
-  }
+// Middleware
+app.use(cors());
+app.use(express.json());
 
-  setupMiddleware() {
-    // CORS para permitir chamadas de qualquer origem
-    this.app.use(cors({
-      origin: '*',
-      methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key']
-    }));
+// Google OAuth2 configuration
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI || `${process.env.RENDER_EXTERNAL_URL || 'http://localhost:3000'}/auth/callback`
+);
 
-    // Parse JSON
-    this.app.use(express.json());
-    
-    // Parse URL encoded
-    this.app.use(express.urlencoded({ extended: true }));
+// Calendar API instance
+const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
 
-    // Middleware de log
-    this.app.use((req, res, next) => {
-      console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-      next();
-    });
-  }
+// Store tokens (in production, use a proper database)
+let tokenStore = {};
 
-  async getCredentials() {
-    try {
-      // Tenta ler das variáveis de ambiente primeiro (produção)
-      if (process.env.GOOGLE_CALENDAR_CREDENTIALS) {
-        return JSON.parse(process.env.GOOGLE_CALENDAR_CREDENTIALS);
-      }
-      
-      // Fallback para arquivo local (desenvolvimento)
-      const credentialsData = await fs.readFile('gcp-oauth-keys.json', 'utf8');
-      return JSON.parse(credentialsData);
-    } catch (error) {
-      throw new Error('Não foi possível carregar as credenciais do Google Calendar');
-    }
-  }
+// ===========================================
+// OpenAI MCP Compatible Endpoints
+// ===========================================
 
-  setupRoutes() {
-    // Página inicial com informações da API
-    this.app.get('/', (req, res) => {
-      res.json({
-        name: 'Google Calendar REST API Server',
-        version: '1.0.0',
-        description: 'REST API para integração com Google Calendar (estilo MCP)',
-        endpoints: {
-          auth: {
-            'GET /auth/url': 'Obter URL de autenticação',
-            'GET /auth/status': 'Verificar status de autenticação',
-            'GET /auth/callback': 'Callback de autenticação (usado pelo Google)',
-          },
-          calendar: {
-            'GET /calendar/events': 'Listar eventos',
-            'POST /calendar/events': 'Criar evento',
-            'PUT /calendar/events/:id': 'Atualizar evento',
-            'DELETE /calendar/events/:id': 'Deletar evento'
-          },
-          mcp: {
-            'GET /mcp/tools': 'Listar ferramentas disponíveis (compatível com MCP)',
-            'POST /mcp/call': 'Executar ferramenta (compatível com MCP)'
-          }
-        },
-        authentication: {
-          status: this.tokens.has('default') ? 'authenticated' : 'not_authenticated',
-          method: 'OAuth 2.0'
-        }
-      });
-    });
-
-    // ===== ROTAS DE AUTENTICAÇÃO =====
-    this.app.get('/auth/url', async (req, res) => {
-      try {
-        const credentials = await this.getCredentials();
-        const { client_secret, client_id } = credentials.web || credentials.installed;
-        
-        // Usar URL base do servidor atual
-        const baseUrl = process.env.RENDER_EXTERNAL_URL || 
-                       process.env.BASE_URL || 
-                       `http://localhost:${process.env.PORT || 3000}`;
-        
-        const redirectUri = `${baseUrl}/auth/callback`;
-
-        const oAuth2Client = new google.auth.OAuth2(
-          client_id,
-          client_secret,
-          redirectUri
-        );
-
-        const authUrl = oAuth2Client.generateAuthUrl({
-          access_type: 'offline',
-          scope: ['https://www.googleapis.com/auth/calendar'],
-          prompt: 'consent'
-        });
-
-        res.json({
-          auth_url: authUrl,
-          redirect_uri: redirectUri,
-          instructions: 'Acesse a auth_url no navegador, faça login e autorize o acesso'
-        });
-      } catch (error) {
-        res.status(500).json({ error: error.message });
-      }
-    });
-
-    this.app.get('/auth/status', (req, res) => {
-      const isAuthenticated = this.tokens.has('default');
-      res.json({
-        authenticated: isAuthenticated,
-        status: isAuthenticated ? 'ready' : 'authentication_required',
-        timestamp: new Date().toISOString()
-      });
-    });
-
-    this.app.get('/auth/callback', async (req, res) => {
-      try {
-        const { code, error } = req.query;
-
-        if (error) {
-          return res.status(400).json({ error: `Authentication error: ${error}` });
-        }
-
-        if (!code) {
-          return res.status(400).json({ error: 'Authorization code not received' });
-        }
-
-        const credentials = await this.getCredentials();
-        const { client_secret, client_id } = credentials.web || credentials.installed;
-        
-        const baseUrl = process.env.RENDER_EXTERNAL_URL || 
-                       process.env.BASE_URL || 
-                       `http://localhost:${process.env.PORT || 3000}`;
-        
-        const redirectUri = `${baseUrl}/auth/callback`;
-
-        const oAuth2Client = new google.auth.OAuth2(
-          client_id,
-          client_secret,
-          redirectUri
-        );
-
-        const { tokens } = await oAuth2Client.getToken(code);
-        
-        // Salva o token na memória
-        this.tokens.set('default', tokens);
-        
-        console.log('✅ Token salvo com sucesso!');
-
-        // Resposta em JSON para APIs ou HTML para navegador
-        if (req.headers.accept && req.headers.accept.includes('application/json')) {
-          res.json({
-            success: true,
-            message: 'Authentication successful',
-            authenticated: true
-          });
-        } else {
-          // HTML para visualização no navegador
-          res.send(`
-            <!DOCTYPE html>
-            <html>
-            <head>
-              <title>Autenticação Concluída</title>
-              <style>
-                body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f5f5f5; }
-                .container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); max-width: 500px; margin: 0 auto; }
-                .success { color: #28a745; }
-              </style>
-            </head>
-            <body>
-              <div class="container">
-                <h1 class="success">✅ Autenticação realizada com sucesso!</h1>
-                <p>Agora você pode usar a API do Google Calendar.</p>
-                <p><strong>Status:</strong> Pronto para uso</p>
-                <p><a href="/">Voltar à página inicial</a></p>
-              </div>
-            </body>
-            </html>
-          `);
-        }
-      } catch (error) {
-        console.error('Erro no callback de autenticação:', error);
-        res.status(500).json({ error: error.message });
-      }
-    });
-
-    // ===== ROTAS DE CALENDÁRIO =====
-    this.app.get('/calendar/events', async (req, res) => {
-      try {
-        const auth = await this.getAuthenticatedClient();
-        const calendar = google.calendar({ version: 'v3', auth });
-
-        const {
-          maxResults = 10,
-          timeMin = new Date().toISOString(),
-          timeMax
-        } = req.query;
-
-        const response = await calendar.events.list({
-          calendarId: 'primary',
-          timeMin,
-          timeMax,
-          maxResults: parseInt(maxResults),
-          singleEvents: true,
-          orderBy: 'startTime',
-        });
-
-        const events = response.data.items || [];
-        
-        res.json({
-          events: events.map(event => ({
-            id: event.id,
-            summary: event.summary,
-            description: event.description,
-            location: event.location,
-            start: event.start.dateTime || event.start.date,
-            end: event.end.dateTime || event.end.date,
-            status: event.status,
-            htmlLink: event.htmlLink
-          })),
-          total: events.length
-        });
-      } catch (error) {
-        res.status(error.code === 401 ? 401 : 500).json({ error: error.message });
-      }
-    });
-
-    this.app.post('/calendar/events', async (req, res) => {
-      try {
-        const auth = await this.getAuthenticatedClient();
-        const calendar = google.calendar({ version: 'v3', auth });
-
-        const { summary, description, location, start, end } = req.body;
-
-        if (!summary || !start || !end) {
-          return res.status(400).json({ 
-            error: 'Missing required fields: summary, start, end' 
-          });
-        }
-
-        const event = {
-          summary,
-          description,
-          location,
-          start: { dateTime: start },
-          end: { dateTime: end },
-        };
-
-        const response = await calendar.events.insert({
-          calendarId: 'primary',
-          resource: event,
-        });
-
-        res.json({
-          success: true,
-          event: {
-            id: response.data.id,
-            summary: response.data.summary,
-            start: response.data.start.dateTime,
-            end: response.data.end.dateTime,
-            htmlLink: response.data.htmlLink
-          }
-        });
-      } catch (error) {
-        res.status(error.code === 401 ? 401 : 500).json({ error: error.message });
-      }
-    });
-
-    this.app.put('/calendar/events/:id', async (req, res) => {
-      try {
-        const auth = await this.getAuthenticatedClient();
-        const calendar = google.calendar({ version: 'v3', auth });
-        const { id } = req.params;
-
-        // Busca evento atual
-        const currentEvent = await calendar.events.get({
-          calendarId: 'primary',
-          eventId: id,
-        });
-
-        const { summary, description, location, start, end } = req.body;
-
-        const updatedEvent = {
-          summary: summary || currentEvent.data.summary,
-          description: description !== undefined ? description : currentEvent.data.description,
-          location: location !== undefined ? location : currentEvent.data.location,
-          start: start ? { dateTime: start } : currentEvent.data.start,
-          end: end ? { dateTime: end } : currentEvent.data.end,
-        };
-
-        const response = await calendar.events.update({
-          calendarId: 'primary',
-          eventId: id,
-          resource: updatedEvent,
-        });
-
-        res.json({
-          success: true,
-          event: {
-            id: response.data.id,
-            summary: response.data.summary,
-            start: response.data.start.dateTime || response.data.start.date,
-            end: response.data.end.dateTime || response.data.end.date,
-            htmlLink: response.data.htmlLink
-          }
-        });
-      } catch (error) {
-        if (error.code === 404) {
-          res.status(404).json({ error: 'Event not found' });
-        } else {
-          res.status(error.code === 401 ? 401 : 500).json({ error: error.message });
-        }
-      }
-    });
-
-    this.app.delete('/calendar/events/:id', async (req, res) => {
-      try {
-        const auth = await this.getAuthenticatedClient();
-        const calendar = google.calendar({ version: 'v3', auth });
-        const { id } = req.params;
-
-        // Busca evento antes de deletar para retornar informações
-        const eventResponse = await calendar.events.get({
-          calendarId: 'primary',
-          eventId: id,
-        });
-        
-        const eventTitle = eventResponse.data.summary;
-        
-        await calendar.events.delete({
-          calendarId: 'primary',
-          eventId: id,
-        });
-
-        res.json({
-          success: true,
-          message: 'Event deleted successfully',
-          deleted_event: {
-            id,
-            title: eventTitle
-          }
-        });
-      } catch (error) {
-        if (error.code === 404) {
-          res.status(404).json({ error: 'Event not found' });
-        } else {
-          res.status(error.code === 401 ? 401 : 500).json({ error: error.message });
-        }
-      }
-    });
-
-    // ===== ROTAS COMPATÍVEIS COM MCP =====
-    this.app.get('/mcp/tools', (req, res) => {
-      res.json({
-        tools: [
-          {
-            name: 'get_auth_url',
-            description: 'Obter URL de autenticação do Google Calendar',
-            inputSchema: {
-              type: 'object',
-              properties: {},
+// MCP Discovery endpoint - lists all available tools
+app.get('/tools/list', async (req, res) => {
+  try {
+    const tools = [
+      {
+        name: 'list_calendar_events',
+        description: 'List events from Google Calendar with optional date filtering',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            timeMin: {
+              type: 'string',
+              description: 'Start time for events (ISO 8601 format, e.g., 2024-01-01T00:00:00Z)'
             },
-          },
-          {
-            name: 'get_auth_status',
-            description: 'Verificar status da autenticação',
-            inputSchema: {
-              type: 'object',
-              properties: {},
+            timeMax: {
+              type: 'string', 
+              description: 'End time for events (ISO 8601 format, e.g., 2024-12-31T23:59:59Z)'
             },
-          },
-          {
-            name: 'list_events',
-            description: 'Listar eventos do Google Calendar',
-            inputSchema: {
+            maxResults: {
+              type: 'integer',
+              description: 'Maximum number of events to return (default: 10)',
+              default: 10
+            },
+            singleEvents: {
+              type: 'boolean',
+              description: 'Whether to expand recurring events (default: true)',
+              default: true
+            }
+          }
+        }
+      },
+      {
+        name: 'create_calendar_event',
+        description: 'Create a new event in Google Calendar',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            summary: {
+              type: 'string',
+              description: 'Event title/summary'
+            },
+            description: {
+              type: 'string',
+              description: 'Event description (optional)'
+            },
+            start: {
               type: 'object',
               properties: {
-                maxResults: {
-                  type: 'number',
-                  description: 'Número máximo de eventos para retornar (padrão: 10)',
-                },
-                timeMin: {
+                dateTime: {
                   type: 'string',
-                  description: 'Data/hora mínima (ISO 8601)',
+                  description: 'Start date and time (ISO 8601 format)'
                 },
-                timeMax: {
+                timeZone: {
                   type: 'string',
-                  description: 'Data/hora máxima (ISO 8601)',
-                },
+                  description: 'Time zone (default: America/Sao_Paulo)',
+                  default: 'America/Sao_Paulo'
+                }
               },
+              required: ['dateTime']
             },
-          },
-          {
-            name: 'create_event',
-            description: 'Criar um novo evento no Google Calendar',
-            inputSchema: {
+            end: {
               type: 'object',
               properties: {
-                summary: {
+                dateTime: {
                   type: 'string',
-                  description: 'Título do evento',
+                  description: 'End date and time (ISO 8601 format)'
                 },
-                description: {
+                timeZone: {
                   type: 'string',
-                  description: 'Descrição do evento',
-                },
-                start: {
-                  type: 'string',
-                  description: 'Data/hora de início (ISO 8601)',
-                },
-                end: {
-                  type: 'string',
-                  description: 'Data/hora de fim (ISO 8601)',
-                },
-                location: {
-                  type: 'string',
-                  description: 'Local do evento',
-                },
+                  description: 'Time zone (default: America/Sao_Paulo)',
+                  default: 'America/Sao_Paulo'
+                }
               },
-              required: ['summary', 'start', 'end'],
+              required: ['dateTime']
             },
-          },
-          {
-            name: 'delete_event',
-            description: 'Deletar um evento do Google Calendar',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                eventId: {
-                  type: 'string',
-                  description: 'ID do evento a ser deletado',
-                },
+            attendees: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  email: { type: 'string' }
+                }
               },
-              required: ['eventId'],
+              description: 'List of attendee emails (optional)'
             },
+            location: {
+              type: 'string',
+              description: 'Event location (optional)'
+            }
           },
-          {
-            name: 'update_event',
-            description: 'Atualizar um evento existente no Google Calendar',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                eventId: {
-                  type: 'string',
-                  description: 'ID do evento a ser atualizado',
-                },
-                summary: {
-                  type: 'string',
-                  description: 'Novo título do evento',
-                },
-                description: {
-                  type: 'string',
-                  description: 'Nova descrição do evento',
-                },
-                start: {
-                  type: 'string',
-                  description: 'Nova data/hora de início (ISO 8601)',
-                },
-                end: {
-                  type: 'string',
-                  description: 'Nova data/hora de fim (ISO 8601)',
-                },
-                location: {
-                  type: 'string',
-                  description: 'Novo local do evento',
-                },
-              },
-              required: ['eventId'],
-            },
-          },
-        ],
-      });
-    });
-
-    this.app.post('/mcp/call', async (req, res) => {
-      try {
-        const { tool, params } = req.body;
-
-        if (!tool) {
-          return res.status(400).json({ error: 'Missing tool name' });
+          required: ['summary', 'start', 'end']
         }
-
-        let result;
-        switch (tool) {
-          case 'get_auth_url':
-            const authResponse = await fetch(`${req.protocol}://${req.get('host')}/auth/url`);
-            result = await authResponse.json();
-            break;
-          case 'get_auth_status':
-            const statusResponse = await fetch(`${req.protocol}://${req.get('host')}/auth/status`);
-            result = await statusResponse.json();
-            break;
-          case 'list_events':
-            const eventsResponse = await fetch(`${req.protocol}://${req.get('host')}/calendar/events?${new URLSearchParams(params || {})}`);
-            result = await eventsResponse.json();
-            break;
-          case 'create_event':
-            const createResponse = await fetch(`${req.protocol}://${req.get('host')}/calendar/events`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(params)
-            });
-            result = await createResponse.json();
-            break;
-          case 'delete_event':
-            const deleteResponse = await fetch(`${req.protocol}://${req.get('host')}/calendar/events/${params.eventId}`, {
-              method: 'DELETE'
-            });
-            result = await deleteResponse.json();
-            break;
-          case 'update_event':
-            const { eventId, ...updateParams } = params;
-            const updateResponse = await fetch(`${req.protocol}://${req.get('host')}/calendar/events/${eventId}`, {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(updateParams)
-            });
-            result = await updateResponse.json();
-            break;
-          default:
-            return res.status(400).json({ error: `Unknown tool: ${tool}` });
+      },
+      {
+        name: 'update_calendar_event',
+        description: 'Update an existing event in Google Calendar',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            eventId: {
+              type: 'string',
+              description: 'The ID of the event to update'
+            },
+            summary: {
+              type: 'string', 
+              description: 'Event title/summary'
+            },
+            description: {
+              type: 'string',
+              description: 'Event description'
+            },
+            start: {
+              type: 'object',
+              properties: {
+                dateTime: { type: 'string' },
+                timeZone: { type: 'string', default: 'America/Sao_Paulo' }
+              }
+            },
+            end: {
+              type: 'object', 
+              properties: {
+                dateTime: { type: 'string' },
+                timeZone: { type: 'string', default: 'America/Sao_Paulo' }
+              }
+            },
+            location: {
+              type: 'string',
+              description: 'Event location'
+            }
+          },
+          required: ['eventId']
         }
-
-        res.json({
-          success: true,
-          tool,
-          result
-        });
-      } catch (error) {
-        res.status(500).json({ 
-          success: false, 
-          error: error.message,
-          tool: req.body.tool 
-        });
+      },
+      {
+        name: 'delete_calendar_event',
+        description: 'Delete an event from Google Calendar',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            eventId: {
+              type: 'string',
+              description: 'The ID of the event to delete'
+            }
+          },
+          required: ['eventId']
+        }
       }
-    });
+    ];
 
-    // Tratamento de rotas não encontradas
-    this.app.use((req, res) => {
-      res.status(404).json({
-        error: 'Route not found',
-        available_endpoints: [
-          'GET /',
-          'GET /auth/url',
-          'GET /auth/status',
-          'GET /calendar/events',
-          'POST /calendar/events',
-          'PUT /calendar/events/:id',
-          'DELETE /calendar/events/:id',
-          'GET /mcp/tools',
-          'POST /mcp/call'
-        ]
-      });
-    });
+    res.json({ tools });
+  } catch (error) {
+    console.error('Error listing tools:', error);
+    res.status(500).json({ error: 'Failed to list tools' });
   }
+});
 
-  async getAuthenticatedClient() {
-    const credentials = await this.getCredentials();
-    const { client_secret, client_id } = credentials.web || credentials.installed;
+// MCP Tool execution endpoint
+app.post('/tools/call', async (req, res) => {
+  try {
+    const { name, arguments: args } = req.body;
 
-    const baseUrl = process.env.RENDER_EXTERNAL_URL || 
-                   process.env.BASE_URL || 
-                   `http://localhost:${process.env.PORT || 3000}`;
-    
-    const redirectUri = `${baseUrl}/auth/callback`;
-
-    const oAuth2Client = new google.auth.OAuth2(
-      client_id,
-      client_secret,
-      redirectUri
-    );
-
-    // Busca o token salvo
-    const token = this.tokens.get('default');
-    if (token) {
-      oAuth2Client.setCredentials(token);
-      
-      // Verifica se o token precisa ser renovado
-      if (token.expiry_date && token.expiry_date <= Date.now()) {
-        try {
-          const { credentials } = await oAuth2Client.refreshAccessToken();
-          this.tokens.set('default', credentials);
-          oAuth2Client.setCredentials(credentials);
-        } catch (error) {
-          this.tokens.delete('default');
-          throw new Error('Token expirado. Faça nova autenticação.');
-        }
-      }
-      
-      return oAuth2Client;
+    // Check if user is authenticated
+    if (!tokenStore.access_token) {
+      return res.status(401).json({ 
+        error: 'Not authenticated. Please visit /auth/url to authenticate first.' 
+      });
     }
 
-    throw new Error('Não autenticado. Use /auth/url para obter o link de autenticação.');
-  }
-
-  start() {
-    const port = process.env.PORT || 3000;
-    
-    this.app.listen(port, () => {
-      console.log(`🚀 Google Calendar REST API Server rodando na porta ${port}`);
-      console.log(`📋 Documentação da API: http://localhost:${port}/`);
-      console.log(`🔐 Autenticação: http://localhost:${port}/auth/url`);
-      console.log(`📅 Endpoints de calendário:`);
-      console.log(`   GET    /calendar/events`);
-      console.log(`   POST   /calendar/events`);
-      console.log(`   PUT    /calendar/events/:id`);
-      console.log(`   DELETE /calendar/events/:id`);
-      console.log(`🔧 Endpoints compatíveis com MCP:`);
-      console.log(`   GET    /mcp/tools`);
-      console.log(`   POST   /mcp/call`);
+    // Set tokens
+    oauth2Client.setCredentials({
+      access_token: tokenStore.access_token,
+      refresh_token: tokenStore.refresh_token
     });
+
+    let result;
+
+    switch (name) {
+      case 'list_calendar_events':
+        result = await listCalendarEvents(args);
+        break;
+      case 'create_calendar_event':
+        result = await createCalendarEvent(args);
+        break;
+      case 'update_calendar_event':
+        result = await updateCalendarEvent(args);
+        break;
+      case 'delete_calendar_event':
+        result = await deleteCalendarEvent(args);
+        break;
+      default:
+        return res.status(400).json({ error: `Unknown tool: ${name}` });
+    }
+
+    res.json({ 
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(result, null, 2)
+        }
+      ]
+    });
+
+  } catch (error) {
+    console.error('Error calling tool:', error);
+    res.status(500).json({ error: error.message });
   }
+});
+
+// ===========================================
+// Tool Implementation Functions
+// ===========================================
+
+async function listCalendarEvents(args = {}) {
+  const params = {
+    calendarId: 'primary',
+    timeMin: args.timeMin || new Date().toISOString(),
+    timeMax: args.timeMax,
+    maxResults: args.maxResults || 10,
+    singleEvents: args.singleEvents !== false,
+    orderBy: 'startTime'
+  };
+
+  const response = await calendar.events.list(params);
+  
+  const events = response.data.items?.map(event => ({
+    id: event.id,
+    summary: event.summary,
+    description: event.description,
+    start: event.start?.dateTime || event.start?.date,
+    end: event.end?.dateTime || event.end?.date,
+    location: event.location,
+    attendees: event.attendees?.map(a => a.email),
+    htmlLink: event.htmlLink,
+    status: event.status
+  })) || [];
+
+  return {
+    success: true,
+    events,
+    total: events.length,
+    message: `Found ${events.length} events`
+  };
 }
 
-// Inicializar servidor
-const server = new GoogleCalendarRestServer();
-server.start();
+async function createCalendarEvent(args) {
+  const event = {
+    summary: args.summary,
+    description: args.description,
+    start: {
+      dateTime: args.start.dateTime,
+      timeZone: args.start.timeZone || 'America/Sao_Paulo'
+    },
+    end: {
+      dateTime: args.end.dateTime,
+      timeZone: args.end.timeZone || 'America/Sao_Paulo'
+    },
+    location: args.location,
+    attendees: args.attendees?.map(email => ({ email }))
+  };
 
-export default GoogleCalendarRestServer;
+  const response = await calendar.events.insert({
+    calendarId: 'primary',
+    resource: event
+  });
+
+  return {
+    success: true,
+    event: {
+      id: response.data.id,
+      summary: response.data.summary,
+      start: response.data.start,
+      end: response.data.end,
+      htmlLink: response.data.htmlLink
+    },
+    message: 'Event created successfully'
+  };
+}
+
+async function updateCalendarEvent(args) {
+  const eventId = args.eventId;
+  delete args.eventId;
+
+  // Get current event data first
+  const currentEvent = await calendar.events.get({
+    calendarId: 'primary',
+    eventId: eventId
+  });
+
+  // Merge current data with updates
+  const updatedEvent = {
+    ...currentEvent.data,
+    ...args
+  };
+
+  const response = await calendar.events.update({
+    calendarId: 'primary',
+    eventId: eventId,
+    resource: updatedEvent
+  });
+
+  return {
+    success: true,
+    event: {
+      id: response.data.id,
+      summary: response.data.summary,
+      start: response.data.start,
+      end: response.data.end,
+      htmlLink: response.data.htmlLink
+    },
+    message: 'Event updated successfully'
+  };
+}
+
+async function deleteCalendarEvent(args) {
+  await calendar.events.delete({
+    calendarId: 'primary',
+    eventId: args.eventId
+  });
+
+  return {
+    success: true,
+    eventId: args.eventId,
+    message: 'Event deleted successfully'
+  };
+}
+
+// ===========================================
+// Authentication Endpoints (unchanged)
+// ===========================================
+
+app.get('/auth/url', (req, res) => {
+  const scopes = ['https://www.googleapis.com/auth/calendar'];
+  const authUrl = oauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    scope: scopes,
+    prompt: 'consent'
+  });
+
+  res.json({
+    auth_url: authUrl,
+    redirect_uri: oauth2Client.redirectUri,
+    instructions: 'Acesse a auth_url no navegador, faça login e autorize o acesso'
+  });
+});
+
+app.get('/auth/callback', async (req, res) => {
+  const { code } = req.query;
+
+  if (!code) {
+    return res.status(400).send('Authorization code missing');
+  }
+
+  try {
+    const { tokens } = await oauth2Client.getToken(code);
+    tokenStore = tokens;
+    oauth2Client.setCredentials(tokens);
+
+    res.send(`
+      <h2>✅ Authentication Successful!</h2>
+      <p>Your Google Calendar API is now authenticated and ready to use.</p>
+      <p><strong>Your server is ready for OpenAI MCP integration!</strong></p>
+      <h3>MCP Endpoints:</h3>
+      <ul>
+        <li><strong>Tools List:</strong> GET /tools/list</li>
+        <li><strong>Tool Execution:</strong> POST /tools/call</li>
+      </ul>
+      <p>You can now use this server with OpenAI's Responses API MCP tool.</p>
+    `);
+  } catch (error) {
+    console.error('Authentication error:', error);
+    res.status(500).send('Authentication failed');
+  }
+});
+
+app.get('/auth/status', (req, res) => {
+  res.json({
+    authenticated: !!tokenStore.access_token,
+    method: 'OAuth 2.0'
+  });
+});
+
+// ===========================================
+// Health Check and Documentation
+// ===========================================
+
+app.get('/', (req, res) => {
+  res.json({
+    name: 'Google Calendar MCP Server - OpenAI Compatible',
+    version: '2.0.0',
+    description: 'OpenAI MCP compatible Google Calendar API server',
+    status: tokenStore.access_token ? 'authenticated' : 'not_authenticated',
+    mcp_endpoints: {
+      'GET /tools/list': 'List all available MCP tools',
+      'POST /tools/call': 'Execute MCP tools'
+    },
+    auth_endpoints: {
+      'GET /auth/url': 'Get OAuth authentication URL',
+      'GET /auth/callback': 'OAuth callback (used by Google)',
+      'GET /auth/status': 'Check authentication status'
+    },
+    usage: {
+      step1: 'Visit /auth/url to authenticate with Google',
+      step2: 'Use /tools/list to see available tools',
+      step3: 'Use /tools/call to execute tools',
+      openai_integration: 'Use this server URL in OpenAI Responses API MCP tool configuration'
+    }
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'healthy', 
+    timestamp: new Date().toISOString(),
+    authenticated: !!tokenStore.access_token
+  });
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`🚀 OpenAI MCP Compatible Google Calendar Server running on port ${PORT}`);
+  console.log(`📚 Documentation: http://localhost:${PORT}`);
+  console.log(`🔧 MCP Tools List: http://localhost:${PORT}/tools/list`);
+  console.log(`🔑 Authentication: http://localhost:${PORT}/auth/url`);
+});
